@@ -9,12 +9,15 @@ from keras.optimizers import Adam
 from keras.initializers import normal
 from keras.models import load_model
 from keras.callbacks import TensorBoard
+from keras import backend as K
 
 from collections import namedtuple, deque
+import tensorflow as tf
 
 import random
 
-from gym_unity.envs import UnityEnv
+sess = tf.Session()
+K.set_session(sess)
 
 Transition = namedtuple('Transition',
                         ('state', 'action', 'next_state', 'reward'))
@@ -26,12 +29,12 @@ class DQN:
         self.memory = deque(maxlen=2000)
 
         self.gamma = 0.85
-        #self.epsilon = 1.0
+        self.epsilon = 1.0
         self.epsilon = 0.05
         self.epsilon_min = 0.01
         self.epsilon_decay = 0.995
         self.learning_rate = 0.01
-        self.tau = .25
+        self.tau = .33
 
         #self.model = load_model("./trial-990.model")
         #self.target_model = load_model("./trial-990.model")
