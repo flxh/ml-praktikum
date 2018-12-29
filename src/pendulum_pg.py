@@ -94,7 +94,7 @@ class REINFORCEAgent:
         self.reward_holder = tf.placeholder(shape=[None, 1], dtype=tf.float32)
         self.action_holder = tf.placeholder(shape=[None, 1], dtype=tf.float32)
 
-        self.loss = - tf.reduce_mean((self.action_holder - self.model.output) * self.reward_holder)
+        self.loss = - tf.reduce_mean(tf.multiply((self.action_holder - self.model.output), self.reward_holder))
         optimizer = tf.train.AdamOptimizer(learning_rate=self.learning_rate)
         self.optimize_op = optimizer.minimize(self.loss)
 
@@ -155,10 +155,10 @@ class REINFORCEAgent:
 
 def main():
     BUFFER_SIZE = 20000
-    EPSILON_DECAY = 0.9999
+    EPSILON_DECAY = 0.99999
     EPSILON_MIN = 0.05
     ACTION_SCALAR = 2
-    AGENT_LR = 0.001
+    AGENT_LR = 0.0001
 
     agent_path = "agent_pend_pg.h5"
 
