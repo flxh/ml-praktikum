@@ -20,6 +20,10 @@ from collections import deque
 
 
 class OrnsteinUhlenbeckActionNoise:
+    '''
+    Class to create explorative noise. An Ornstein-Uhlenbeck-Process is used in this case,
+    because it provides better exploration than gaussian noise.
+    '''
     def __init__(self, mu, sigma=0.3, theta=.15, dt=1e-2, x0=None):
         self.theta = theta
         self.mu = mu
@@ -39,6 +43,9 @@ class OrnsteinUhlenbeckActionNoise:
 
 
 class ReplayBuffer(object):
+    '''
+    Stores all the simulated trajectories. And provides functions to randomly sample experience from the buffer.
+    '''
 
     def __init__(self, buffer_size):
         self.buffer_size = buffer_size
