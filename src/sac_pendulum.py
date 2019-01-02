@@ -8,7 +8,7 @@ from datetime import datetime
 
 
 class Policy:
-    def __init__(self, sess, state_size, action_size, lr, alpha_entropy):
+    def __init__(self, sess, state_size, action_size, lr, batch_size, alpha_entropy):
         self.action_size = action_size
         self.state_size = state_size
         self.sess = sess
@@ -16,12 +16,12 @@ class Policy:
         with tf.variable_scope("Policy"):
             with tf.variable_scope("model"):
                 self.state_input, model_output = self._create_model()
-                self.mean_action = model_output[..., action_size:]
+                self.mean_action = tf.math.tanh(model_output[..., action_size:])*2
                 log_sigma = model_output[..., :action_size]
 
                 dist = tfp.distributions.MultivariateNormalDiag(loc=self.mean_action, scale_diag=tf.exp(log_sigma))
 
-                self.variables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, "Policy/model") # TODO
+                self.variables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, "Policy/model")
                 self.action = dist.sample()
 
             with tf.variable_scope("probs"):
@@ -37,17 +37,19 @@ class Policy:
 
                 self.log_prob_grad_a = tf.gradients(self.training_log_prob_op, self.training_action)
 
-                self.entropy_summary = tf.summary.scalar("entropy", - tf.reduce_mean(self.log_prob_op))
+                self.entropy_summary = tf.summary.scalar("entropy", - tf.reduce_mean(self.training_log_prob_op*self.training_probs))
 
-                # TODO use actions sampled in main loop or inc
                 #maximizes reward
                 grad_s1 = tf.gradients(self.action, self.variables, (self.log_prob_grad_a-self.q_grad_a), name="grad_s1")
                 #maximizes entropy
                 grad_s2 = tf.gradients(self.training_log_prob_op, self.variables, name="grad_s2")
 
                 with tf.variable_scope("gradient"):
-                    self.grad = [grad_s1[i] + alpha_entropy * grad_s2[i] for i in range(len(grad_s1))]
-                    self.clipped_grad = [tf.clip_by_value(g, -1, 1) for g in self.grad]
+                    self.grad = [(grad_s1[i] + alpha_entropy * grad_s2[i])/batch_size for i in range(len(grad_s1))]
+                    self.clipped_grad,_ = tf.clip_by_global_norm(self.grad, 7)
+
+                    self.c_grad_summaries = [tf.summary.histogram("pol_grads_{}".format(i), self.clipped_grad[i]) for i in range(len(self.clipped_grad))]
+
                     grads = zip(self.clipped_grad, self.variables)
 
                 optimizer = tf.train.AdamOptimizer(lr)
@@ -70,12 +72,12 @@ class Policy:
         })
 
     def train(self, states, actions, q_grad_a):
-        es, _ =self.sess.run([self.entropy_summary, self.optimize], feed_dict={
+        es, gs, _ =self.sess.run([self.entropy_summary, self.c_grad_summaries, self.optimize], feed_dict={
             self.q_grad_a:q_grad_a,
             self.state_input: states,
             self.training_action: actions
         })
-        return es
+        return es, gs
 
     def _create_model(self):
         layer_names = ["layer-1", "layer-2", "layer-3"]
@@ -123,7 +125,12 @@ class StateValueApproximator:
 
             with tf.variable_scope("training"):
                 self.optimizer = tf.train.AdamOptimizer(lr)
-                self.optimize = self.optimizer.minimize(self.loss, var_list=self.model_variables)
+                self.grads = tf.gradients(self.loss, self.model_variables)
+                self.clipped_grads,_ = tf.clip_by_global_norm(self.grads, 7)
+
+                grad_var_pairs = zip(self.clipped_grads, self.model_variables)
+
+                self.optimize = self.optimizer.apply_gradients(grad_var_pairs)
 
             self.summaries = tf.summary.merge_all(scope="V_s/model")
 
@@ -185,7 +192,12 @@ class QValueApproximator:
 
             with tf.variable_scope("training"):
                 optimizer = tf.train.AdamOptimizer(lr)
-                self.optimize = optimizer.minimize(self.loss, var_list=self.variables)
+                self.grads = tf.gradients(self.loss, self.variables)
+                self.clipped_grads,_ = tf.clip_by_global_norm(self.grads, 7)
+
+                grad_var_pairs = zip(self.clipped_grads, self.variables)
+
+                self.optimize = optimizer.apply_gradients(grad_var_pairs)
 
             with tf.variable_scope("grad_a"):
                 self.q_summary = tf.summary.scalar("q_value", tf.reduce_mean(self.output))
@@ -237,35 +249,36 @@ class QValueApproximator:
         })
         return loss_summary
 
+
+# HYPERPARAMETERS
+
 BATCH_SIZE = 128
 ACTION_SIZE = 1
-ALPHA = 0.1
+ALPHA = 0.03
 STATE_SIZE = 3
-LR_POLICY = 6E-5
-LR_VALUE = 3E-4
-LR_Q = 3E-4
-TAU = 0.02
+LR = 3E-4
+TAU = 0.005
 GAMMA = 0.99
+
+tb_verbose = False
 
 with tf.Session() as sess:
     env = gym.make("Pendulum-v0")
 
-    vs = StateValueApproximator(sess, STATE_SIZE, LR_VALUE, TAU, ALPHA)
-    pol = Policy(sess, STATE_SIZE, ACTION_SIZE, LR_POLICY, ALPHA)
-    q1 = QValueApproximator(sess, "Q1", STATE_SIZE, ACTION_SIZE, LR_Q)
-    q2 = QValueApproximator(sess, "Q2", STATE_SIZE, ACTION_SIZE, LR_Q)
+    vs = StateValueApproximator(sess, STATE_SIZE, LR, TAU, ALPHA)
+    pol = Policy(sess, STATE_SIZE, ACTION_SIZE, LR, BATCH_SIZE, ALPHA)
+    q1 = QValueApproximator(sess, "Q1", STATE_SIZE, ACTION_SIZE, LR)
+    q2 = QValueApproximator(sess, "Q2", STATE_SIZE, ACTION_SIZE, LR)
 
     now =datetime.now()
 
-    writer = tf.summary.FileWriter("/tmp/tb/{}".format(now.strftime("%Y-%m-%dT%H:%M:%S")), sess.graph)
+    # SET PATH
+    writer = tf.summary.FileWriter("/home/florus/tb/t:{}-a:{}-lr:{}#{}".format(TAU, ALPHA, LR, now.strftime("%H:%M:%S")), sess.graph)
 
-    buffer = deque(maxlen=100000)
+    buffer = deque(maxlen=200000)
 
     summary_val = tf.placeholder(tf.float32, [])
     reward_summary = tf.summary.scalar("reward", summary_val)
-
-    log_prob_vals = tf.placeholder(tf.float32, [None, 1])
-    lp_summary = tf.summary.histogram("log_probs", log_prob_vals)
 
     init = tf.global_variables_initializer()
     sess.run(init)
@@ -302,45 +315,46 @@ with tf.Session() as sess:
             next_states = np.array([s[3] for s in batch])
             dones = np.reshape([s[4] for s in batch], [-1, 1])
 
-            summaries = []
+            var_summaries = []
+            loss_summaries = []
 
             on_policy_actions, log_probs = pol.predict(states)
-
-            rew_sum = sess.run(lp_summary, feed_dict={
-                log_prob_vals: log_probs
-            })
-            writer.add_summary(rew_sum, steps)
 
             qval1 = q1.predict(states, on_policy_actions)
             qval2 = q2.predict(states, on_policy_actions)
 
             qvalmin = np.minimum(qval1, qval2)
 
-            loss_summary = vs.train(states, qvalmin, log_probs)
-            summaries.append(loss_summary)
+            v_loss_summary = vs.train(states, qvalmin, log_probs)
+            loss_summaries.append(v_loss_summary)
 
             v_targets = vs.predict_target(next_states)
             q_targets = rewards + GAMMA * v_targets * np.logical_not(dones)
 
             q1loss = q1.train(states, actions, q_targets)
             q2loss = q2.train(states, actions, q_targets)
-            summaries.extend([q1loss, q2loss])
+            loss_summaries.extend([q1loss, q2loss])
 
             grad_as, q_summary = q1.grad_a(states, on_policy_actions)
-            writer.add_summary(q_summary, steps)
-            entropy = pol.train(states, on_policy_actions, grad_as)
-            writer.add_summary(entropy, steps)
+            loss_summaries.append(q_summary)
+            entropy_summary, pol_grad_summaries = pol.train(states, on_policy_actions, grad_as)
+            loss_summaries.append(entropy_summary)
 
             vs.update_target()
 
-            summaries.extend([
-                pol.get_summaries(),
-                q1.get_summaries(),
-                q2.get_summaries()
-            ])
+            for ls in loss_summaries:
+                writer.add_summary(ls, steps)
 
-            summaries.extend([vs.get_summaries()])
-            for summary in summaries:
+            if tb_verbose:
+                var_summaries.extend(pol_grad_summaries)
+                var_summaries.extend([
+                    pol.get_summaries(),
+                    q1.get_summaries(),
+                    q2.get_summaries(),
+                    vs.get_summaries()
+                ])
+
+            for summary in var_summaries:
                 writer.add_summary(summary, steps)
 
             state = next_state
