@@ -7,19 +7,24 @@ import numpy as np
 from datetime import datetime
 
 
+GRADIENT_NORM = 5
+
 class Policy:
-    def __init__(self, sess, state_size, action_size, lr, batch_size, alpha_entropy):
+    def __init__(self, sess, state_size, action_size, lr, batch_size, alpha_entropy, policy_reg_coeff, kernel_reg):
         self.action_size = action_size
         self.state_size = state_size
         self.sess = sess
+        self.kernel_reg = kernel_reg
 
         with tf.variable_scope("Policy"):
             with tf.variable_scope("model"):
-                self.state_input, model_output = self._create_model()
-                self.mean_action = tf.math.tanh(model_output[..., action_size:])*2
-                log_sigma = model_output[..., :action_size]
+                self.state_input, self.model_output = self._create_model()
+                mean_action_lin = self.model_output[..., action_size:]
+                self.mean_action = tf.tanh(mean_action_lin)
+                self.log_sigma = self.model_output[..., :action_size]
+                self.sigma = tf.exp(self.log_sigma)
 
-                dist = tfp.distributions.MultivariateNormalDiag(loc=self.mean_action, scale_diag=tf.exp(log_sigma))
+                dist = tfp.distributions.MultivariateNormalDiag(loc=self.mean_action, scale_diag=self.sigma)
 
                 self.variables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, "Policy/model")
                 self.action = dist.sample()
@@ -27,6 +32,9 @@ class Policy:
             with tf.variable_scope("probs"):
                 self.probs = dist.prob(self.action)
                 self.log_prob_op = tf.reshape(tf.log(self.probs),[-1, 1])
+
+            with tf.variable_scope("saver"):
+                self.saver = tf.train.Saver(var_list=self.variables)
 
             with tf.variable_scope("training"):
                 self.q_grad_a = tf.placeholder(tf.float32, [None, action_size])
@@ -37,16 +45,28 @@ class Policy:
 
                 self.log_prob_grad_a = tf.gradients(self.training_log_prob_op, self.training_action)
 
-                self.entropy_summary = tf.summary.scalar("entropy", - tf.reduce_mean(self.training_log_prob_op*self.training_probs))
+                # gravitates toward stddev of 0.5
+                self.pol_reg_loss = tf.reduce_sum(tf.maximum(self.sigma-0.65, 0)**2)
+                # mean can move freely between -3...3 -> tanh -0.995 ..0.995
+                self.pol_reg_loss+= tf.reduce_sum(tf.maximum(tf.abs(self.model_output)-3, 0)**2)
 
+                self.entropy_summary = tf.summary.scalar("entropy", - tf.reduce_mean(self.training_log_prob_op*self.training_probs))
+                self.log_prob_summary = tf.summary.scalar("mean_log_prob", - tf.reduce_mean(self.training_log_prob_op))
+                self.regularization_loss_summary = tf.summary.scalar("reg_loss", self.pol_reg_loss)
+
+                self.training_summaries = tf.summary.merge([self.entropy_summary, self.log_prob_summary, self.regularization_loss_summary])
+
+                #output regularization
+                grad_reg = tf.gradients(self.pol_reg_loss, self.variables, name="grad_reg")
                 #maximizes reward
                 grad_s1 = tf.gradients(self.action, self.variables, (self.log_prob_grad_a-self.q_grad_a), name="grad_s1")
                 #maximizes entropy
                 grad_s2 = tf.gradients(self.training_log_prob_op, self.variables, name="grad_s2")
 
                 with tf.variable_scope("gradient"):
-                    self.grad = [(grad_s1[i] + alpha_entropy * grad_s2[i])/batch_size for i in range(len(grad_s1))]
-                    self.clipped_grad,_ = tf.clip_by_global_norm(self.grad, 7)
+                    self.grad = [(grad_s1[i] + alpha_entropy * grad_s2[i] + policy_reg_coeff * grad_reg[i])/batch_size for i in range(len(grad_s1))]
+                    self.grad = [tf.clip_by_value(g, -1, 1) for g in self.grad]
+                    self.clipped_grad,_ = tf.clip_by_global_norm(self.grad, GRADIENT_NORM)
 
                     self.c_grad_summaries = [tf.summary.histogram("pol_grads_{}".format(i), self.clipped_grad[i]) for i in range(len(self.clipped_grad))]
 
@@ -57,22 +77,16 @@ class Policy:
 
             self.summary_op = tf.summary.merge_all(scope="Policy/model")
 
-    def log_probs_for_action(self, states, actions):
-        return self.sess.run(self.log_prob_op, feed_dict={
-            self.state_input: states,
-            self.action_ph: actions
-        })
-
     def get_summaries(self):
         return self.sess.run(self.summary_op)
 
     def predict(self, state):
-        return sess.run([self.action, self.log_prob_op], feed_dict={
+        return self.sess.run([self.action, self.log_prob_op, self.mean_action, self.sigma], feed_dict={
             self.state_input: state
         })
 
     def train(self, states, actions, q_grad_a):
-        es, gs, _ =self.sess.run([self.entropy_summary, self.c_grad_summaries, self.optimize], feed_dict={
+        es, gs, _ =self.sess.run([self.training_summaries, self.c_grad_summaries, self.optimize], feed_dict={
             self.q_grad_a:q_grad_a,
             self.state_input: states,
             self.training_action: actions
@@ -81,12 +95,11 @@ class Policy:
 
     def _create_model(self):
         layer_names = ["layer-1", "layer-2", "layer-3"]
-        initializer = tf.initializers.random_uniform(-0.05, 0.05)
 
         state_input = tf.placeholder(tf.float32, [None, self.state_size])
-        d1 = tf.layers.Dense(64, activation="relu", name=layer_names[0], kernel_initializer = initializer)(state_input)
-        d2 = tf.layers.Dense(32, activation="relu", name=layer_names[1], kernel_initializer = initializer)(d1)
-        output = tf.layers.Dense(2*self.action_size, name=layer_names[2], kernel_initializer = initializer)(d2)
+        d1 = tf.layers.Dense(64, activation="relu", name=layer_names[0], kernel_initializer = tf.initializers.he_normal(), kernel_regularizer=tf.contrib.layers.l2_regularizer(scale=self.kernel_reg))(state_input)
+        d2 = tf.layers.Dense(32, activation="relu", name=layer_names[1], kernel_initializer = tf.initializers.he_normal(), kernel_regularizer=tf.contrib.layers.l2_regularizer(scale=self.kernel_reg))(d1)
+        output = tf.layers.Dense(2*self.action_size, name=layer_names[2], kernel_initializer = tf.initializers.he_normal(), kernel_regularizer=tf.contrib.layers.l2_regularizer(scale=self.kernel_reg))(d2)
 
         for name in layer_names:
             with tf.variable_scope(name, reuse=True):
@@ -95,26 +108,33 @@ class Policy:
 
         return state_input, output
 
+    def save_variables(self, path, steps):
+        self.saver.save(self.sess, path, steps)
+
 
 class StateValueApproximator:
-    def __init__(self, sess, state_size, lr, tau, alpha):
+    def __init__(self, sess, state_size, lr, tau, alpha, kernel_reg):
         self.sess = sess
         self.state_size = state_size
+        self.kernel_reg = kernel_reg
 
         with tf.variable_scope("V_s"):
             with tf.variable_scope("model"):
                 self.state_input, self.value_output = self._create_model()
 
-            self.model_variables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope="V_s/model")
+            self.variables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope="V_s/model")
 
             with tf.variable_scope("target_model"):
                 self.target_state_input, self.target_value_output = self._create_model()
 
-            self.target_model_variables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope="V_s/target_model")
+            self.target_variables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope="V_s/target_model")
+
+            with tf.variable_scope("saver"):
+                self.saver = tf.train.Saver(var_list=self.variables)
 
             with tf.variable_scope("target_copy"):
-                self.copy_ops = [self.target_model_variables[i].assign(self.target_model_variables[i] * (1. - tau) + self.model_variables[i] *  tau)
-                                 for i in range(len(self.model_variables))]
+                self.copy_ops = [self.target_variables[i].assign(self.target_variables[i] * (1. - tau) + self.variables[i] * tau)
+                                 for i in range(len(self.variables))]
 
             with tf.variable_scope("loss"):
                 self.q_value_ph = tf.placeholder(tf.float32, [None, 1])
@@ -125,10 +145,11 @@ class StateValueApproximator:
 
             with tf.variable_scope("training"):
                 self.optimizer = tf.train.AdamOptimizer(lr)
-                self.grads = tf.gradients(self.loss, self.model_variables)
-                self.clipped_grads,_ = tf.clip_by_global_norm(self.grads, 7)
+                self.grads = tf.gradients(self.loss, self.variables)
+                self.grads = [tf.clip_by_value(g, -1, 1) for g in self.grads]
+                self.clipped_grads,_ = tf.clip_by_global_norm(self.grads, GRADIENT_NORM)
 
-                grad_var_pairs = zip(self.clipped_grads, self.model_variables)
+                grad_var_pairs = zip(self.clipped_grads, self.variables)
 
                 self.optimize = self.optimizer.apply_gradients(grad_var_pairs)
 
@@ -138,9 +159,9 @@ class StateValueApproximator:
         layer_names = ["layer-1", "layer-2", "layer-3"]
 
         state_input = tf.placeholder(tf.float32, [None, self.state_size])
-        d1 = tf.layers.Dense(64, activation="relu", name=layer_names[0])(state_input)
-        d2 = tf.layers.Dense(32, activation="relu", name=layer_names[1])(d1)
-        output = tf.layers.Dense(1, name=layer_names[2])(d2)
+        d1 = tf.layers.Dense(64, activation="relu", name=layer_names[0], kernel_initializer = tf.initializers.he_normal(), kernel_regularizer=tf.contrib.layers.l2_regularizer(scale=self.kernel_reg))(state_input)
+        d2 = tf.layers.Dense(64, activation="relu", name=layer_names[1], kernel_initializer = tf.initializers.he_normal(), kernel_regularizer=tf.contrib.layers.l2_regularizer(scale=self.kernel_reg))(d1)
+        output = tf.layers.Dense(1, name=layer_names[2], kernel_initializer = tf.initializers.he_normal(), kernel_regularizer=tf.contrib.layers.l2_regularizer(scale=self.kernel_reg))(d2)
 
         for name in layer_names:
             with tf.variable_scope(name, reuse=True):
@@ -173,17 +194,25 @@ class StateValueApproximator:
         })
         return loss_summary
 
+    def save_variables(self, path, steps):
+        self.saver.save(self.sess, path, steps)
+
 
 class QValueApproximator:
-    def __init__(self, sess, name, state_size, action_size, lr):
+    def __init__(self, sess, name, state_size, action_size, lr, kernel_reg):
         self.sess = sess
         self.state_size = state_size
         self.action_size = action_size
+        self.kernel_reg = kernel_reg
+
         with tf.variable_scope(name):
             with tf.variable_scope("model"):
                 self.state_input, self.action_input, self.output = self._create_model()
 
             self.variables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope="{}/model".format(name))
+
+            with tf.variable_scope("saver"):
+                self.saver = tf.train.Saver(var_list=self.variables)
 
             with tf.variable_scope("loss"):
                 self.q_target_ph = tf.placeholder(tf.float32, [None, 1])
@@ -193,7 +222,8 @@ class QValueApproximator:
             with tf.variable_scope("training"):
                 optimizer = tf.train.AdamOptimizer(lr)
                 self.grads = tf.gradients(self.loss, self.variables)
-                self.clipped_grads,_ = tf.clip_by_global_norm(self.grads, 7)
+                self.grads = [tf.clip_by_value(g, -1, 1) for g in self.grads]
+                self.clipped_grads,_ = tf.clip_by_global_norm(self.grads, GRADIENT_NORM)
 
                 grad_var_pairs = zip(self.clipped_grads, self.variables)
 
@@ -209,15 +239,15 @@ class QValueApproximator:
         layer_names = ["layer-s1", "layer-s2", "layer-a1", "layer-m1", "layer-m2"]
 
         state_input = tf.placeholder(tf.float32, [None, self.state_size])
-        ds1 = tf.layers.Dense(64, activation="relu", name=layer_names[0])(state_input)
-        merge_s = tf.layers.Dense(64, name=layer_names[1])(ds1)
+        ds1 = tf.layers.Dense(64, activation="relu", name=layer_names[0], kernel_initializer =tf.initializers.he_normal(), kernel_regularizer=tf.contrib.layers.l2_regularizer(scale=self.kernel_reg))(state_input)
+        merge_s = tf.layers.Dense(64, name=layer_names[1], kernel_initializer = tf.initializers.he_normal(), kernel_regularizer=tf.contrib.layers.l2_regularizer(scale=self.kernel_reg))(ds1)
 
         action_input = tf.placeholder(tf.float32, [None, self.action_size])
-        merge_a = tf.layers.Dense(64, name=layer_names[2])(action_input)
+        merge_a = tf.layers.Dense(64, name=layer_names[2], kernel_initializer =tf.initializers.he_normal(), kernel_regularizer=tf.contrib.layers.l2_regularizer(scale=self.kernel_reg))(action_input)
 
         merged = tf.add(merge_a, merge_s)
-        dm1 = tf.layers.Dense(64, activation="relu", name=layer_names[3])(merged)
-        output = tf.layers.Dense(1, name=layer_names[4])(dm1)
+        dm1 = tf.layers.Dense(64, activation="relu", name=layer_names[3], kernel_initializer = tf.initializers.he_normal(), kernel_regularizer=tf.contrib.layers.l2_regularizer(scale=self.kernel_reg))(merged)
+        output = tf.layers.Dense(1, name=layer_names[4], kernel_initializer = tf.initializers.he_normal(), kernel_regularizer=tf.contrib.layers.l2_regularizer(scale=self.kernel_reg))(dm1)
 
         for name in layer_names:
             with tf.variable_scope(name, reuse=True):
@@ -249,31 +279,41 @@ class QValueApproximator:
         })
         return loss_summary
 
+    def save_variables(self, path, steps):
+        self.saver.save(self.sess, path, steps)
+
 
 # HYPERPARAMETERS
 
+
 BATCH_SIZE = 128
-ACTION_SIZE = 1
-ALPHA = 0.03
-STATE_SIZE = 3
-LR = 3E-4
+ALPHA = 0.1
+LR = 3e-4
+
+# These hyperparameters can be left as they are
 TAU = 0.005
 GAMMA = 0.99
+POL_REG = 0.0001
+KERNEL_REG = 0.0001
 
-tb_verbose = False
+ACTION_BOUND = 2
+ACTION_SIZE = 1
+STATE_SIZE = 3
+
+tb_verbose = True
 
 with tf.Session() as sess:
     env = gym.make("Pendulum-v0")
 
-    vs = StateValueApproximator(sess, STATE_SIZE, LR, TAU, ALPHA)
-    pol = Policy(sess, STATE_SIZE, ACTION_SIZE, LR, BATCH_SIZE, ALPHA)
-    q1 = QValueApproximator(sess, "Q1", STATE_SIZE, ACTION_SIZE, LR)
-    q2 = QValueApproximator(sess, "Q2", STATE_SIZE, ACTION_SIZE, LR)
+    vs = StateValueApproximator(sess, STATE_SIZE, LR, TAU, ALPHA,KERNEL_REG)
+    pol = Policy(sess, STATE_SIZE, ACTION_SIZE, LR, BATCH_SIZE, ALPHA, POL_REG, KERNEL_REG)
+    q1 = QValueApproximator(sess, "Q1", STATE_SIZE, ACTION_SIZE, LR, KERNEL_REG)
+    q2 = QValueApproximator(sess, "Q2", STATE_SIZE, ACTION_SIZE, LR, KERNEL_REG)
 
     now =datetime.now()
 
     # SET PATH
-    writer = tf.summary.FileWriter("/home/florus/tb/t:{}-a:{}-lr:{}#{}".format(TAU, ALPHA, LR, now.strftime("%H:%M:%S")), sess.graph)
+    writer = tf.summary.FileWriter("/home/florus/tb-p/t:{}-a:{}-lr:{}#{}".format(TAU, ALPHA, LR, now.strftime("%H:%M:%S")), sess.graph)
 
     buffer = deque(maxlen=200000)
 
@@ -297,8 +337,8 @@ with tf.Session() as sess:
 
             env.render()
 
-            action_array, _ = pol.predict(np.reshape(state, [1, -1]))
-            action = action_array[0]
+            action_array, _, _, _ = pol.predict(np.reshape(state, [1, -1]))
+            action = action_array[0] * ACTION_BOUND
             next_state, reward, done, _ = env.step(action)
 
             episode_reward += reward
@@ -318,7 +358,7 @@ with tf.Session() as sess:
             var_summaries = []
             loss_summaries = []
 
-            on_policy_actions, log_probs = pol.predict(states)
+            on_policy_actions, log_probs,_,_ = pol.predict(states)
 
             qval1 = q1.predict(states, on_policy_actions)
             qval2 = q2.predict(states, on_policy_actions)
