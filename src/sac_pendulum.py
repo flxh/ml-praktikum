@@ -45,8 +45,7 @@ class Policy:
 
                 self.log_prob_grad_a = tf.gradients(self.training_log_prob_op, self.training_action)
 
-                # gravitates toward stddev of 0.5
-                self.pol_reg_loss = tf.reduce_sum(tf.maximum(self.sigma-0.65, 0)**2)
+                self.pol_reg_loss = tf.reduce_sum(tf.maximum(self.sigma-0.33, 0)**2)
                 # mean can move freely between -3...3 -> tanh -0.995 ..0.995
                 self.pol_reg_loss+= tf.reduce_sum(tf.maximum(tf.abs(self.model_output)-3, 0)**2)
 
@@ -286,7 +285,7 @@ class QValueApproximator:
 # HYPERPARAMETERS
 
 
-BATCH_SIZE = 128
+BATCH_SIZE = 512
 ALPHA = 0.1
 LR = 3e-4
 
